@@ -64,6 +64,15 @@ DEFAULT_TARGET = Path(os.environ.get(
 DEFAULT_DRAFT_ROOT = ROOT / "models" / "draft"
 DEFAULT_BIN = ROOT / "build" / ("test_dflash" + (".exe" if sys.platform == "win32" else ""))
 DEFAULT_BUDGET = 22
+
+
+def _extra_daemon_has_target_sharding(extra: list[str] | None) -> bool:
+    """True if we spawn test_dflash with multi-GPU target layer split."""
+    if not extra:
+        return False
+    return any(tok.startswith("--target-gpus") for tok in extra)
+
+
 MODEL_NAME = "luce-dflash"
 
 # Architecture strings stored in `general.architecture` of every GGUF this
@@ -206,15 +215,18 @@ def parse_reasoning(
     so the generated text contains only the reasoning body + ``</think>``.
     Returns (cleaned_content, reasoning_content).
     """
+    def _strip_leading_think_closers(value: str) -> str:
+        return re.sub(r"^(?:\s*</think>\s*)+", "", value).strip()
+
     parts = text.partition(THINK_OPEN_TAG)
     saw_open_tag = bool(parts[1])
     rest = parts[2] if saw_open_tag else parts[0]
     if THINK_CLOSE_TAG not in rest:
         if thinking_enabled and (started_in_thinking or saw_open_tag):
             return "", (rest.strip() or None)
-        return rest.strip(), None
+        return _strip_leading_think_closers(rest), None
     reasoning, _, content = rest.partition(THINK_CLOSE_TAG)
-    return content.strip(), (reasoning.strip() or None)
+    return _strip_leading_think_closers(content), (reasoning.strip() or None)
 
 
 def _find_tool_properties(tools, function_name):
@@ -580,10 +592,21 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
               drafter_tokenizer: AutoTokenizer | None = None,
               prefix_cache_slots: int = 4,
               prefill_cache_slots: int = 4,
+              prefill_cache_bytes: int = 0,
               arch: str = "qwen35",
+              extra_daemon_args: list[str] | None = None,
               lazy_draft: bool = False,
               verbose_daemon: bool = False) -> FastAPI:
     import asyncio
+    if _extra_daemon_has_target_sharding(extra_daemon_args):
+        if prefix_cache_slots > 0 or prefill_cache_slots > 0:
+            print(
+                "  [cfg] target-gpus sharding: disabling prefix/full cache "
+                "(daemon SNAPSHOT/RESTORE not implemented for this mode)",
+                flush=True,
+            )
+            prefix_cache_slots = 0
+            prefill_cache_slots = 0
     app = FastAPI(title="Luce DFlash OpenAI server")
 
     @app.exception_handler(OpenAICompatError)
@@ -637,6 +660,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                "--fast-rollback", "--ddtree", f"--ddtree-budget={budget}",
                f"--max-ctx={max_ctx}",
                f"--stream-fd={stream_fd_val}"]
+        if extra_daemon_args:
+            cmd.extend(extra_daemon_args)
     if sys.platform == "win32":
         daemon_proc = subprocess.Popen(cmd, close_fds=False, env=env,
                                        stdin=subprocess.PIPE,
@@ -672,7 +697,7 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         cap=prefix_cache_slots,
     )
     if prefill_cfg is not None and prefill_cache_slots > 0:
-        prefix_cache.init_full_cache(prefill_cache_slots)
+        prefix_cache.init_full_cache(prefill_cache_slots, budget_bytes=prefill_cache_bytes)
     tool_memory = ToolMemory(
         max_entries=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_ENTRIES", "50000")),
         max_bytes=int(os.environ.get("DFLASH_TOOL_MEMORY_MAX_BYTES", str(64 * 1024 * 1024))),
@@ -693,6 +718,11 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
     async def _startup():
         bus.start(asyncio.get_running_loop())
         await prefix_cache.startup_sync()
+        if not getattr(prefix_cache, "_full_disabled", True):
+            restored = await prefix_cache.rehydrate_full_cache(
+                _rehydrate_full_cache_entry)
+            if restored:
+                log.info("full-cache restored %d entries from disk", restored)
         if lazy_draft:
             log.info("lazy-draft: parking decode draft at startup to free ~3.3 GB")
             daemon_proc.stdin.write(b"park draft\n")
@@ -948,6 +978,33 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
         if timing is not None:
             timing["t_cmd_sent"] = time.monotonic()
 
+    async def _rehydrate_full_cache_entry(slot: int, cur_bin_path: str,
+                                          cur_ids_len: int) -> bool:
+        cmd_line = f"{cur_bin_path} 0 snap={cur_ids_len}:{slot}\n"
+        loop = asyncio.get_running_loop()
+        sent = False
+        try:
+            _write_cmd(cmd_line)
+            sent = True
+            await bus.await_reply(f"[snap] inline slot={slot} ", timeout=120.0)
+            await loop.run_in_executor(None, _drain_until_sentinel, r_pipe)
+            return True
+        except Exception as exc:
+            log.warning("full-cache restore failed for slot=%d path=%s: %s",
+                        slot, cur_bin_path, exc)
+            if sent:
+                try:
+                    await loop.run_in_executor(None, _drain_until_sentinel, r_pipe)
+                except Exception:
+                    pass
+                try:
+                    daemon_proc.stdin.write(f"FREE_SNAPSHOT {slot}\n".encode("utf-8"))
+                    daemon_proc.stdin.flush()
+                    await bus.await_reply(f"[snap] freed slot={slot}", timeout=5.0)
+                except Exception:
+                    pass
+            return False
+
     def _park_draft_if_lazy(timing=None):
         """Park decode draft to free ~3.3 GB VRAM. Call after tokens consumed."""
         if not lazy_draft:
@@ -1195,9 +1252,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                                 else:  # mode == "content"
                                     think_idx = window.find(THINK_OPEN_TAG)
+                                    think_close_idx = window.find(THINK_CLOSE_TAG)
                                     tool_idx  = window.find(TOOL_OPEN_TAG)
                                     hits = [(i, t) for i, t in
-                                            ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                                            ((think_idx, "think"),
+                                             (think_close_idx, "think_close"),
+                                             (tool_idx, "tool")) if i != -1]
                                     if hits:
                                         hits.sort()
                                         idx, which = hits[0]
@@ -1208,6 +1268,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                         if which == "think":
                                             window = window[idx + len(THINK_OPEN_TAG):]
                                             mode = "reasoning"
+                                        elif which == "think_close":
+                                            window = window[idx + len(THINK_CLOSE_TAG):]
                                         else:
                                             tool_buffer = window[idx:]
                                             window = ""
@@ -2046,9 +2108,12 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
 
                             else:  # content
                                 think_idx = window.find(THINK_OPEN_TAG)
+                                think_close_idx = window.find(THINK_CLOSE_TAG)
                                 tool_idx = window.find(TOOL_OPEN_TAG)
                                 hits = [(i, t) for i, t in
-                                        ((think_idx, "think"), (tool_idx, "tool")) if i != -1]
+                                        ((think_idx, "think"),
+                                         (think_close_idx, "think_close"),
+                                         (tool_idx, "tool")) if i != -1]
                                 if hits:
                                     hits.sort()
                                     idx, which = hits[0]
@@ -2061,6 +2126,8 @@ def build_app(target: Path, draft: Path | None, bin_path: Path, budget: int, max
                                     if which == "think":
                                         window = window[idx + len(THINK_OPEN_TAG):]
                                         mode = "reasoning"
+                                    elif which == "think_close":
+                                        window = window[idx + len(THINK_CLOSE_TAG):]
                                     else:
                                         tool_buffer = window[idx:]
                                         window = ""
@@ -2235,7 +2302,26 @@ def main():
                          "timing and per-step diagnostics.")
     ap.add_argument("--prefix-cache-slots", type=int, default=4)
     ap.add_argument("--prefill-cache-slots", type=int, default=4)
+    ap.add_argument("--prefill-cache-bytes", type=int, default=0,
+                    help="Disk budget in bytes for persisted full-cache artifacts. "
+                         "0 disables budget trimming.")
     ap.add_argument("--daemon", action="store_true")
+    ap.add_argument("--target-gpu", type=int, default=None,
+                    help="Visible CUDA device id for test_dflash (sets DFLASH_TARGET_GPU)")
+    ap.add_argument("--draft-gpu", type=int, default=None,
+                    help="Visible CUDA device id for draft (sets DFLASH_DRAFT_GPU)")
+    ap.add_argument("--target-gpus", type=str, default=None,
+                    help="Comma-separated target GPU ids for target-layer sharding (passes --target-gpus)")
+    # nargs='?' so Compose can use a bare `--target-layer-split` line before another
+    # flag; const="" means "use test_dflash defaults" (we do not forward an empty value).
+    ap.add_argument("--target-layer-split", nargs="?", const="", default=None,
+                    metavar="WEIGHTS",
+                    help="Optional comma-separated layer split weights for --target-gpus "
+                         "(omit WEIGHTS after the flag to use defaults)")
+    ap.add_argument("--draft-feature-mirror", action="store_true",
+                    help="Pass --draft-feature-mirror to test_dflash (safe cross-GPU feature path)")
+    ap.add_argument("--peer-access", action="store_true",
+                    help="Pass --peer-access to test_dflash (prefer P2P memcpy when available)")
     add_cli_flags(ap)
     args = ap.parse_args()
     prefill_cfg = config_from_args(args)
@@ -2249,6 +2335,11 @@ def main():
 
     if args.fa_window is not None:
         os.environ["DFLASH27B_FA_WINDOW"] = str(args.fa_window)
+
+    if args.target_gpu is not None:
+        os.environ["DFLASH_TARGET_GPU"] = str(args.target_gpu)
+    if args.draft_gpu is not None:
+        os.environ["DFLASH_DRAFT_GPU"] = str(args.draft_gpu)
 
     if args.prefill_compression != "off":
         os.environ.setdefault("DFLASH27B_LM_HEAD_FIX", "0")
@@ -2295,13 +2386,33 @@ def main():
         drafter_tokenizer = AutoTokenizer.from_pretrained(
             prefill_cfg.drafter_tokenizer_id, trust_remote_code=True)
 
+    extra_daemon: list[str] = []
+    if args.draft_feature_mirror:
+        extra_daemon.append("--draft-feature-mirror")
+    if args.peer_access:
+        extra_daemon.append("--peer-access")
+    if args.target_gpus:
+        extra_daemon.append(f"--target-gpus={args.target_gpus}")
+        if args.target_layer_split:
+            extra_daemon.append(f"--target-layer-split={args.target_layer_split}")
+        # Keep sharded daemon behavior aligned with the single-GPU server path.
+        extra_daemon.append("--target-split-load-draft")
+        extra_daemon.append("--target-split-dflash")
+        # Multi-GPU daemon mode currently does not implement SNAPSHOT/RESTORE.
+        if args.prefix_cache_slots > 0 or args.prefill_cache_slots > 0:
+            print("  [cfg] target-gpus daemon mode disables prefix/full cache slots (snapshot protocol unsupported)")
+            args.prefix_cache_slots = 0
+            args.prefill_cache_slots = 0
+
     app = build_app(args.target, draft, args.bin, args.budget, args.max_ctx,
                     tokenizer, stop_ids,
                     prefill_cfg=prefill_cfg if prefill_cfg.enabled else None,
                     drafter_tokenizer=drafter_tokenizer,
                     prefix_cache_slots=args.prefix_cache_slots,
                     prefill_cache_slots=args.prefill_cache_slots,
+                    prefill_cache_bytes=args.prefill_cache_bytes,
                     arch=arch,
+                    extra_daemon_args=extra_daemon or None,
                     lazy_draft=args.lazy_draft,
                     verbose_daemon=args.verbose_daemon)
 
